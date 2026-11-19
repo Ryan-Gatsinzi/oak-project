@@ -44,7 +44,8 @@ If no camera is plugged in (or to test algorithms without hardware), run:
 | `--foot-length-mm <mm>` | Foot length used to rescale normalized COP to mm (default: `261.1`, shoe size 5). |
 | `--toi-ms <ms>` | Manual TOI fallback when no TOI weights are loaded (default: `30.0`). |
 | `--mass <kg>` | Set subject mass in kg (default: `75.0`). |
-| `--blend` | Enables continuous smooth interpolation between heel and toe curves based on COP. |
+| `--controller <continuous\|discrete>` | Selects smooth heel→midfoot→toe smoothstep interpolation (default) or the original discrete controller. |
+| `--blend` | Legacy linear heel/toe blend; only used with `--controller discrete`. |
 | `--bio` | Toggles full biological torque scale (0–90 Nm) vs exoskeleton assistive scale (0–35 Nm). |
 
 ### COP-only mode
@@ -53,6 +54,15 @@ The included weights predict COP only. Without `--toi-weights`, the HUD shows
 `[MANUAL]` next to TOI and uses `--toi-ms` (default `30 ms`, i.e. stair branch)
 so the predicted COP actually drives heel/toe profile selection. Adjust TOI at
 runtime with the arrow keys, or load TOI weights to restore learned TOI.
+
+### COP interpolation mode
+
+The default controller blends the existing Murray heel, midfoot, and toe profiles
+with smoothstep weights over `COP = 0`, `foot_length / 2`, and `foot_length` mm.
+The HUD shows all three reference profiles, the continuous curve, the current COP,
+and the applied weights. `--controller discrete` restores the original switching
+behavior for benchmarking. Learned TOI still selects the separate Collins level-ground
+profile when `TOI > EMD`.
 
 ---
 
@@ -63,6 +73,7 @@ runtime with the arrow keys, or load TOI weights to restore learned TOI.
 | **Q** or **ESC** | Quit visualizer |
 | **SPACE** | Freeze / pause frame |
 | **A** | Toggle Auto-inference vs Interactive Manual Mode |
+| **V** | Toggle continuous interpolation vs original discrete controller |
 | **C** | Force Level Ground (Collins profile) |
 | **H** | Force Stair Ascent Heel-Strike profile |
 | **T** | Force Stair Ascent Toe-Strike profile |

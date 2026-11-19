@@ -19,7 +19,6 @@ Features:
 import os
 import sys
 import time
-import json
 import argparse
 from datetime import timedelta
 from collections import deque
@@ -43,6 +42,20 @@ except ImportError:
         DEFAULT_FOOT_LENGTH_MM,
     )
 
+from torque_profiles import (
+    collins_profile as _collins_profile,
+    load_profile_coefficients,
+    poly5_profile as _poly5_profile,
+)
+from torque_interpolation import (
+    HEEL,
+    MID,
+    TOE,
+    blend_profiles,
+    cop_interpolation_weights,
+    select_discrete_profile,
+)
+
 # Optional DepthAI import
 try:
     import depthai as dai
@@ -64,91 +77,35 @@ class TorqueProfileManager:
         self.mid_foot_mm = 263.2 / 2.0  # 131.6 mm
         self.emd_ms = 50.0  # Electromechanical delay in ms
 
-        # Locate stair parameter JSON files
         if base_dir is None:
             base_dir = os.path.dirname(os.path.abspath(__file__))
-        params_dir = os.path.join(base_dir, "Dephy-Soft-Sensor-integrate_cop_toi_ml", "params")
-
-        self.heel_params = self._load_json(os.path.join(params_dir, "heel_params.json"), [
-            -1.3418952053455997e-07, 1.7845671326326224e-05, -0.0008115159297602824,
-            0.014257060759835865, -0.05348055449407867, 0.05081448731224058
-        ])
-        self.toe_params = self._load_json(os.path.join(params_dir, "toe_params.json"), [
-            -2.6283254641545553e-07, 3.629269408838788e-05, -0.001707299481976467,
-            0.029826242570955334, -0.08755150988293577, 0.1387268050697176
-        ])
-        self.mid_params = self._load_json(os.path.join(params_dir, "mid_params.json"), [
-            -1.8018684186184578e-07, 2.393482843276188e-05, -0.0010667010483254012,
-            0.01686895559962403, -0.013305050756574633, 0.052798802400771463
-        ])
-
-    def _load_json(self, path, fallback):
-        if os.path.exists(path):
-            try:
-                with open(path, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"[WARN] Failed to read {path}: {e}. Using fallback.")
-        return fallback
+        coefficients = load_profile_coefficients(base_dir)
+        self.heel_params = coefficients[HEEL]
+        self.mid_params = coefficients[MID]
+        self.toe_params = coefficients[TOE]
 
     def collins_profile(self, percent_gait, peak_torque_normalized=0.20):
-        """
-        Zhang & Collins Level Ground Cubic Spline Profile.
-        percent_gait: numpy array or float in [0, 100].
-        Returns: torque in Nm.
-        """
-        t0 = 0.0
-        t1 = 27.1
-        t2 = 50.4
-        t3 = 62.7
-        ts = 2.0  # onset torque (Nm)
-        tp = self.user_mass * peak_torque_normalized  # peak torque (Nm)
-
-        x = np.asarray(percent_gait, dtype=np.float32)
-        tau = np.zeros_like(x)
-
-        # Region 1: Linear onset ramp [t0, t1]
-        m1 = (x >= t0) & (x <= t1)
-        tau[m1] = ts / (t1 - t0) * (x[m1] - t0)
-
-        # Region 2: Rising cubic spline [t1, t2]
-        m2 = (x > t1) & (x <= t2)
-        denom1 = (t1 - t2) ** 3
-        a1 = (2.0 * (tp - ts)) / denom1
-        b1 = -3.0 * (t1 + t2) * (tp - ts) / denom1
-        c1 = 6.0 * t1 * t2 * (tp - ts) / denom1
-        d1 = -(- (t1 ** 3) * tp + 3 * (t1 ** 2) * t2 * tp - 3 * t1 * (t2 ** 2) * ts + (t2 ** 3) * ts) / denom1
-        tau[m2] = a1 * (x[m2] ** 3) + b1 * (x[m2] ** 2) + c1 * x[m2] + d1
-
-        # Region 3: Falling cubic spline [t2, t3]
-        m3 = (x > t2) & (x <= t3)
-        denom2 = 2.0 * ((t2 - t3) ** 3)
-        a2 = -(tp - ts) / denom2
-        b2 = 3.0 * t3 * (tp - ts) / denom2
-        c2 = 3.0 * (t2 ** 2 - 2 * t2 * t3) * (tp - ts) / denom2
-        d2 = -(3 * (t2 ** 2) * t3 * tp - 6 * t2 * (t3 ** 2) * tp + 2 * (t3 ** 3) * tp - 2 * (t2 ** 3) * ts + 3 * (t2 ** 2) * t3 * ts) / denom2
-        tau[m3] = a2 * (x[m3] ** 3) + b2 * (x[m3] ** 2) + c2 * x[m3] + d2
-
-        return np.maximum(tau, 0.0)
+        return _collins_profile(percent_gait, self.user_mass, peak_torque_normalized)
 
     def poly5_profile(self, percent_gait, coeffs, scale_factor=0.25):
-        """
-        Murray 5th-Degree Polynomial Stair Profile.
-        coeffs: [p0, p1, p2, p3, p4, p5]
-        scale_factor: fraction of biological torque provided by the exoskeleton (default 0.25)
-        """
-        x = np.asarray(percent_gait, dtype=np.float32)
-        val = sum(c * (x ** (5 - i)) for i, c in enumerate(coeffs))
-        mask = (x > 3.0) & (x <= 60.0) & (val > 0.0)
-        tau = np.zeros_like(x)
-        tau[mask] = val[mask] * self.user_mass * scale_factor
-        return np.maximum(tau, 0.0)
+        return _poly5_profile(percent_gait, coeffs, self.user_mass, scale_factor)
 
     def heel_profile(self, percent_gait, scale_factor=0.25):
         return self.poly5_profile(percent_gait, self.heel_params, scale_factor=scale_factor)
 
+    def mid_profile(self, percent_gait, scale_factor=0.25):
+        return self.poly5_profile(percent_gait, self.mid_params, scale_factor=scale_factor)
+
     def toe_profile(self, percent_gait, scale_factor=0.25):
         return self.poly5_profile(percent_gait, self.toe_params, scale_factor=scale_factor)
+
+    def reference_curves(self, percent_gait, scale_factor=0.25):
+        return {
+            "collins": self.collins_profile(percent_gait),
+            HEEL: self.heel_profile(percent_gait, scale_factor=scale_factor),
+            MID: self.mid_profile(percent_gait, scale_factor=scale_factor),
+            TOE: self.toe_profile(percent_gait, scale_factor=scale_factor),
+        }
 
     def torque_to_motor_current_ma(self, torque_nm):
         """Converts Nm to mA for Dephy ExoBoot actuator (kt = 140 Nmm/A)."""
@@ -341,7 +298,9 @@ class RealTimeVisualizerHUD:
         self.C_DIM = (140, 150, 160)
         self.C_CYAN = (235, 175, 40)      # Level ground / Collins
         self.C_AMBER = (50, 185, 255)     # Stair Heel
+        self.C_MID = (90, 220, 130)       # Stair Midfoot
         self.C_ORANGE = (40, 110, 255)    # Stair Toe
+        self.C_CONTINUOUS = (220, 90, 220)
         self.C_GREEN = (80, 210, 100)
         self.C_RED = (80, 80, 240)
 
@@ -420,9 +379,11 @@ class RealTimeVisualizerHUD:
 
     def render_frame(self, left_raw, right_raw, stereo_np, toi_ms, cop_mm,
                      state_str, active_curve_y, x_grid, all_curves,
+                     continuous_curve_y, weights,
                      current_gait_pct, current_torque, user_mass, fps, latency_ms,
                      is_synthetic=False, is_paused=False, assist_scale=0.25,
-                     toi_source="MODEL", mid_foot_mm=131.6):
+                     toi_source="MODEL", mid_foot_mm=131.6,
+                     toe_mm=263.2, controller_mode="continuous"):
 
         # Reset canvas background
         self.canvas[:] = self.C_BG
@@ -491,19 +452,31 @@ class RealTimeVisualizerHUD:
         cv2.putText(self.canvas, f"Center-of-Pressure (COP): {cop_mm:.1f} mm", (35, 475), cv2.FONT_HERSHEY_SIMPLEX, 0.50, self.C_TEXT, 1)
         bar2_y = 485
         cv2.rectangle(self.canvas, (bar_x, bar2_y), (bar_x + bar_w, bar2_y + bar_h), (25, 30, 38), -1)
-        fill_cop = int(np.clip(cop_mm / 260.0, 0.0, 1.0) * bar_w)
-        cop_color = self.C_AMBER if cop_mm <= mid_foot_mm else self.C_ORANGE
+        fill_cop = int(np.clip(cop_mm / toe_mm, 0.0, 1.0) * bar_w)
+        if controller_mode == "continuous":
+            cop_color = self.C_CONTINUOUS
+        else:
+            cop_color = self.C_AMBER if cop_mm <= mid_foot_mm else self.C_ORANGE
         cv2.rectangle(self.canvas, (bar_x, bar2_y), (bar_x + fill_cop, bar2_y + bar_h), cop_color, -1)
         cv2.rectangle(self.canvas, (bar_x, bar2_y), (bar_x + bar_w, bar2_y + bar_h), self.C_BORDER, 1)
         # Midfoot threshold
-        mf_x = int(bar_x + (mid_foot_mm / 260.0) * bar_w)
+        mf_x = int(bar_x + (mid_foot_mm / toe_mm) * bar_w)
         cv2.line(self.canvas, (mf_x, bar2_y - 4), (mf_x, bar2_y + bar_h + 4), (255, 255, 255), 2)
         cv2.putText(self.canvas, "Heel", (bar_x, bar2_y + bar_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.40, self.C_DIM, 1)
         cv2.putText(self.canvas, f"Midfoot ({mid_foot_mm:.0f}mm)", (mf_x - 40, bar2_y + bar_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
         cv2.putText(self.canvas, "Toe", (bar_x + bar_w - 25, bar2_y + bar_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.40, self.C_DIM, 1)
 
         # 3. Active State Banner
-        state_color = self.C_CYAN if "LEVEL" in state_str else (self.C_AMBER if "HEEL" in state_str else self.C_ORANGE)
+        if "LEVEL" in state_str:
+            state_color = self.C_CYAN
+        elif "CONTINUOUS" in state_str:
+            state_color = self.C_CONTINUOUS
+        elif "HEEL" in state_str:
+            state_color = self.C_AMBER
+        elif "MID" in state_str:
+            state_color = self.C_MID
+        else:
+            state_color = self.C_ORANGE
         cv2.rectangle(self.canvas, (35, 525), (35 + bar_w, 565), (28, 34, 44), -1)
         cv2.rectangle(self.canvas, (35, 525), (35 + bar_w, 565), state_color, 2)
         cv2.putText(self.canvas, f"STATE: {state_str}", (55, 553), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2, cv2.LINE_AA)
@@ -512,40 +485,55 @@ class RealTimeVisualizerHUD:
         max_torque = 35.0 if assist_scale <= 0.3 else 90.0
         self.draw_graph_grid(max_torque)
 
-        # Draw Inactive / Reference Curves
-        self.plot_curve(x_grid, all_curves["collins"], max_torque, self.C_CYAN, thickness=1, is_active=("LEVEL" in state_str))
-        self.plot_curve(x_grid, all_curves["heel"], max_torque, self.C_AMBER, thickness=1, is_active=("HEEL" in state_str))
-        self.plot_curve(x_grid, all_curves["toe"], max_torque, self.C_ORANGE, thickness=1, is_active=("TOE" in state_str))
+        reference_curves = (
+            ("collins", self.C_CYAN, "LEVEL"),
+            (HEEL, self.C_AMBER, "HEEL"),
+            (MID, self.C_MID, "MID"),
+            (TOE, self.C_ORANGE, "TOE"),
+        )
+        for key, color, state_token in reference_curves:
+            active = controller_mode == "discrete" and state_token in state_str
+            self.plot_curve(x_grid, all_curves[key], max_torque, color, thickness=1, is_active=active)
 
-        # Highlight currently active profile
+        self.plot_curve(
+            x_grid, continuous_curve_y, max_torque, self.C_CONTINUOUS,
+            thickness=2, is_active=controller_mode == "continuous",
+        )
         self.plot_curve(x_grid, active_curve_y, max_torque, state_color, thickness=3, is_active=True)
-
-        # Draw Real-time Gait Cursor
         self.draw_gait_cursor(current_gait_pct, current_torque, max_torque, state_color)
 
-        # Legend Box inside graph
         leg_x = self.gx0 + 20
         leg_y = self.gy0 + 25
-        cv2.line(self.canvas, (leg_x, leg_y), (leg_x + 25, leg_y), self.C_CYAN, 2)
-        cv2.putText(self.canvas, "Collins (Level Ground)", (leg_x + 35, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.C_TEXT, 1)
-
-        cv2.line(self.canvas, (leg_x + 210, leg_y), (leg_x + 235, leg_y), self.C_AMBER, 2)
-        cv2.putText(self.canvas, "Murray Stair (Heel)", (leg_x + 245, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.C_TEXT, 1)
-
-        cv2.line(self.canvas, (leg_x + 420, leg_y), (leg_x + 445, leg_y), self.C_ORANGE, 2)
-        cv2.putText(self.canvas, "Murray Stair (Toe)", (leg_x + 455, leg_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.C_TEXT, 1)
+        legend_entries = (
+            (self.C_CYAN, "Collins (level)"),
+            (self.C_AMBER, f"Heel x{assist_scale:.2f}"),
+            (self.C_MID, f"Mid x{assist_scale:.2f}"),
+            (self.C_ORANGE, f"Toe x{assist_scale:.2f}"),
+            (self.C_CONTINUOUS, "Continuous COP"),
+        )
+        for index, (color, label) in enumerate(legend_entries):
+            ox = leg_x + (index % 3) * 215
+            oy = leg_y + (index // 3) * 22
+            cv2.line(self.canvas, (ox, oy), (ox + 25, oy), color, 2)
+            cv2.putText(self.canvas, label, (ox + 33, oy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.C_TEXT, 1)
 
         # ----------------- Bottom Metrics & Controls -----------------
-        self.draw_panel(self.gx0, 565, self.gw, 60)
+        self.draw_panel(self.gx0, 565, self.gw, 72)
         peak_torque = float(np.max(active_curve_y))
         peak_current_ma = (peak_torque * 1000.0 / 140.0) * 1000.0  # kt = 140 Nmm/A
         metrics_str = f"Peak Torque: {peak_torque:.1f} Nm | Peak Current: {peak_current_ma:.0f} mA | User Mass: {user_mass:.0f} kg"
-        cv2.putText(self.canvas, metrics_str, (self.gx0 + 25, 602), cv2.FONT_HERSHEY_SIMPLEX, 0.58, self.C_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(self.canvas, metrics_str, (self.gx0 + 25, 598), cv2.FONT_HERSHEY_SIMPLEX, 0.58, self.C_TEXT, 1, cv2.LINE_AA)
+        weights_str = (
+            f"COP: {cop_mm:.1f} mm | w_heel: {weights[HEEL]:.2f} | "
+            f"w_mid: {weights[MID]:.2f} | w_toe: {weights[TOE]:.2f}"
+        )
+        cv2.putText(self.canvas, weights_str, (self.gx0 + 25, 622), cv2.FONT_HERSHEY_SIMPLEX, 0.48, self.C_DIM, 1, cv2.LINE_AA)
 
         # Bottom Shortcut Legend
         self.draw_panel(20, 640, self.width - 40, 65)
-        ctrl_title = "CONTROLS: [Q] Quit | [SPACE] Pause | [A] Auto/Interactive Mode | [C] Force Collins | [H] Force Heel | [T] Force Toe"
-        ctrl_sub = "[UP/DOWN] Adjust TOI (+/- 10ms) | [LEFT/RIGHT] Adjust COP (+/- 10mm) | [+ / -] Adjust User Mass | [B] Scale Bio/Assist"
+        ctrl_title = "CONTROLS: [Q] Quit | [SPACE] Pause | [A] Auto/Interactive | [V] Continuous/Discrete | [C/H/T] Presets"
+        ctrl_sub = "[UP/DOWN] TOI | [LEFT/RIGHT] COP | [+ / -] Mass | [B] Bio/Assist"
         cv2.putText(self.canvas, ctrl_title, (40, 668), cv2.FONT_HERSHEY_SIMPLEX, 0.48, self.C_TEXT, 1, cv2.LINE_AA)
         cv2.putText(self.canvas, ctrl_sub, (40, 692), cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.C_DIM, 1, cv2.LINE_AA)
 
@@ -571,7 +559,9 @@ def main():
     parser.add_argument("--resolution", type=int, choices=[400, 720], default=400,
                         help="OAK-D mono resolution: 400 (stable, USB2/3) or 720 (needs USB3). Default: 400")
     parser.add_argument("--mass", type=float, default=75.0, help="Subject body mass in kg (default: 75.0)")
-    parser.add_argument("--blend", action="store_true", help="Enable continuous interpolation between heel and toe curves")
+    parser.add_argument("--controller", choices=["continuous", "discrete"], default="continuous",
+                        help="COP controller: continuous heel/mid/toe interpolation, or original discrete controller")
+    parser.add_argument("--blend", action="store_true", help="Legacy linear heel/toe blend; only used with --controller discrete")
     parser.add_argument("--bio", action="store_true", help="Display full biological torque scale instead of exo assistive scale")
     args = parser.parse_args()
 
@@ -603,6 +593,10 @@ def main():
     manual_cop = forecaster.foot_length_mm / 2.0  # mm
     is_paused = False
     assist_scale = 1.0 if args.bio else 0.25
+    controller_mode = args.controller
+
+    if args.blend and controller_mode == "continuous":
+        print("[WARN] --blend only affects --controller discrete; continuous interpolation is active.")
 
     # Simulation gait sweep
     gait_pct = 0.0
@@ -647,40 +641,38 @@ def main():
 
                 toi_source = "MODEL" if (auto_mode and forecaster.has_toi) else "MANUAL"
 
-                # 3. Decision Logic (Paper & Repo Rules)
-                # EMD = 50 ms, Midfoot = foot_length / 2
+                all_curves = profile_manager.reference_curves(x_grid, scale_factor=assist_scale)
+                weights = cop_interpolation_weights(
+                    cop_pred,
+                    heel_mm=0.0,
+                    mid_mm=profile_manager.mid_foot_mm,
+                    toe_mm=forecaster.foot_length_mm,
+                )
+                continuous_curve = blend_profiles(all_curves, weights)
+
                 if toi_pred > profile_manager.emd_ms:
                     state_str = "LEVEL GROUND (COLLINS PROFILE)"
-                    active_curve = profile_manager.collins_profile(x_grid)
+                    active_curve = all_curves["collins"]
+                elif controller_mode == "continuous":
+                    state_str = f"STAIR CONTINUOUS [COP={cop_pred:.0f}mm]"
+                    active_curve = continuous_curve
                 else:
-                    if cop_pred <= profile_manager.mid_foot_mm:
+                    profile_key = select_discrete_profile(cop_pred, profile_manager.mid_foot_mm)
+                    if profile_key == HEEL:
                         state_str = f"STAIR ASCENT [HEEL STRIKE, COP={cop_pred:.0f}mm]"
-                        active_curve = profile_manager.heel_profile(x_grid, scale_factor=assist_scale)
                     else:
                         state_str = f"STAIR ASCENT [TOE STRIKE, COP={cop_pred:.0f}mm]"
-                        active_curve = profile_manager.toe_profile(x_grid, scale_factor=assist_scale)
+                    active_curve = all_curves[profile_key]
 
                     if args.blend:
-                        # Continuous blending between heel and toe based on COP
                         alpha = float(np.clip((cop_pred - 40.0) / 180.0, 0.0, 1.0))
-                        c_heel = profile_manager.heel_profile(x_grid, scale_factor=assist_scale)
-                        c_toe = profile_manager.toe_profile(x_grid, scale_factor=assist_scale)
-                        active_curve = (1.0 - alpha) * c_heel + alpha * c_toe
+                        active_curve = (1.0 - alpha) * all_curves[HEEL] + alpha * all_curves[TOE]
                         state_str = f"STAIR BLEND [COP={cop_pred:.0f}mm, α={alpha:.2f}]"
 
-                # Advance simulated gait cycle
                 gait_pct = (gait_pct + gait_speed) % 100.0
 
-                # Compute instantaneous commanded torque along active curve
                 idx = int(np.clip((gait_pct / 100.0) * len(x_grid), 0, len(x_grid) - 1))
                 current_torque = float(active_curve[idx])
-
-                # Precompute all 3 curves for reference overlay
-                all_curves = {
-                    "collins": profile_manager.collins_profile(x_grid),
-                    "heel": profile_manager.heel_profile(x_grid, scale_factor=assist_scale),
-                    "toe": profile_manager.toe_profile(x_grid, scale_factor=assist_scale),
-                }
 
                 # 4. Render visualizer frame
                 frame = hud.render_frame(
@@ -693,6 +685,8 @@ def main():
                     active_curve_y=active_curve,
                     x_grid=x_grid,
                     all_curves=all_curves,
+                    continuous_curve_y=continuous_curve,
+                    weights=weights,
                     current_gait_pct=gait_pct,
                     current_torque=current_torque,
                     user_mass=profile_manager.user_mass,
@@ -703,6 +697,8 @@ def main():
                     assist_scale=assist_scale,
                     toi_source=toi_source,
                     mid_foot_mm=profile_manager.mid_foot_mm,
+                    toe_mm=forecaster.foot_length_mm,
+                    controller_mode=controller_mode,
                 )
 
                 cv2.imshow("OAK-D Real-Time Predictive Torque Visualizer", frame)
@@ -718,6 +714,9 @@ def main():
             elif key == ord('a'):  # Toggle Auto / Interactive manual mode
                 auto_mode = not auto_mode
                 print(f"[INFO] Auto-Inference mode: {auto_mode}")
+            elif key == ord('v'):
+                controller_mode = "discrete" if controller_mode == "continuous" else "continuous"
+                print(f"[INFO] Controller: {controller_mode}")
             elif key == ord('c'):  # Force Collins
                 auto_mode = False
                 manual_toi = 180.0
@@ -752,7 +751,7 @@ def main():
                 manual_cop = max(0.0, manual_cop - 10.0)
                 auto_mode = False
             elif key == 2555904 or key == 3:  # RIGHT
-                manual_cop = min(260.0, manual_cop + 10.0)
+                manual_cop = min(forecaster.foot_length_mm, manual_cop + 10.0)
                 auto_mode = False
 
     except RuntimeError as exc:
